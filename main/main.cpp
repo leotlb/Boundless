@@ -18,53 +18,50 @@
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 
-// ESP_LOG tag
-static const char *system_tag = "SYSTEM";
+#include "DHT11.h"
 
-EventGroupHandle_t sensor_events;
+DHT11 sensor_DHT(GPIO_NUM_4);
+
+
+static const char *system_tag = "SYSTEM";   // ESP_LOG tag
 const int kBitTaskLogic = (1 << 0);         // Bit 0 assigned to Task 2 (Sensor Logic)
 const int kBitTaskTelemetry = (1 << 1);     // Bit 1 assigned to Task 3 (Sensor Logging)
 
-float current_temperature = 0.0;
-bool fault_sim = false;
-SemaphoreHandle_t temperature_mutex;
+struct SystemContext {
+    SemaphoreHandle_t temperature_mutex;
+    EventGroupHandle_t sensor_events;
+    
+    // Shared data (previously global)
+    float current_temperature;
+    bool fault_sim;
+};
 
 //  Task 1: Sensor Reading
-//  Strict 2s synchronization of safe writing to shared variable, with esp task watchdog to save
+//  Strict 2s synchronization of safe writing of shared variable, with esp task watchdog to save
 //  from possible system locking up. Uses event groups to signal other tasks.
 void TaskSensorReading(void *pvParameters) {
 
-    esp_task_wdt_add(NULL); 
+    //esp_task_wdt_add(NULL);
+    SystemContext* ctx = (SystemContext*)pvParameters;
 
     // Stores start time and sets frequency for proper 2s synchornization
     TickType_t last_wake_time = xTaskGetTickCount();
     const TickType_t wake_frequency = pdMS_TO_TICKS(2000);
 
-    int fault_counter = 0;
-
     while(true) {
-        // "Kicks the dog": resets timer so the watchdog doesn't trigger a restart
-        esp_task_wdt_reset(); 
 
-        // Fault sim after 10s
-        fault_counter++;
-        if (fault_counter == 5) {
-            fault_sim = true; 
-            ESP_LOGE(system_tag, "[FAULT] DHT11 disconnected or non responsive");
-        }
-
-        // Safe writing of current temperature
-        if (xSemaphoreTake(temperature_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            if (!fault_sim) {
-
-                // Temperature sim
-                current_temperature = 25.0f + (rand() % 70) / 10.0f; 
+        if (xSemaphoreTake(ctx->temperature_mutex, portMAX_DELAY) == pdTRUE) {
+            ctx->fault_sim = sensor_DHT.InFailState();
+            
+            if ( sensor_DHT.ReadData() ) {
+                ctx->current_temperature = sensor_DHT.GetTemperature();
             }
-            xSemaphoreGive(temperature_mutex);
+            
+            xSemaphoreGive(ctx->temperature_mutex);
         }
         
         // Allows the wakeup of task 2 and 3
-        xEventGroupSetBits(sensor_events, kBitTaskLogic | kBitTaskTelemetry);
+        xEventGroupSetBits(ctx->sensor_events, kBitTaskLogic | kBitTaskTelemetry);
 
         vTaskDelayUntil(&last_wake_time, wake_frequency);
     }
@@ -75,16 +72,18 @@ void TaskSensorReading(void *pvParameters) {
 //  Event triggered reading of shared variable with a simple logic check (to be changed).
 void TaskLogic(void *pvParameters) {
 
+    SystemContext* ctx = (SystemContext*)pvParameters;
+
     float local_temperature = 0.0;
 
     while(true) {
-        xEventGroupWaitBits(sensor_events, kBitTaskLogic, pdTRUE, pdFALSE, portMAX_DELAY);
+        xEventGroupWaitBits(ctx->sensor_events, kBitTaskLogic, pdTRUE, pdFALSE, portMAX_DELAY);
 
-        if (xSemaphoreTake(temperature_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            local_temperature = current_temperature;
-            xSemaphoreGive(temperature_mutex);
+        if (xSemaphoreTake(ctx->temperature_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            local_temperature = ctx->current_temperature;
+            xSemaphoreGive(ctx->temperature_mutex);
             
-            if (!fault_sim && local_temperature > 30.0) {
+            if (!ctx->fault_sim && local_temperature > 30.0) {
                 ESP_LOGW(system_tag, "[ALERT] High temperature (%.1fC)", local_temperature);
             }
         }
@@ -95,18 +94,20 @@ void TaskLogic(void *pvParameters) {
 //  Task 3: Sensor Telemetry
 //  Event triggered reading of shared variable with subsequent logging on the console.
 void TaskTelemetry(void *pvParameters) {
+
+    SystemContext* ctx = (SystemContext*)pvParameters;
     
     float local_temperature = 0.0;
 
     while(true) {
-        xEventGroupWaitBits(sensor_events, kBitTaskTelemetry, pdTRUE, pdFALSE, portMAX_DELAY);
+        xEventGroupWaitBits(ctx->sensor_events, kBitTaskTelemetry, pdTRUE, pdFALSE, portMAX_DELAY);
 
-        if (xSemaphoreTake(temperature_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            local_temperature = current_temperature;
-            xSemaphoreGive(temperature_mutex);
+        if (xSemaphoreTake(ctx->temperature_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            local_temperature = ctx->current_temperature;
+            xSemaphoreGive(ctx->temperature_mutex);
 
-            if (!fault_sim) {
-                ESP_LOGI(system_tag, "[LOG] Temperatura atual: %.1fC - Sistema OK", local_temperature);
+            if (!ctx->fault_sim) {
+                ESP_LOGI(system_tag, "[LOG] Current temperature: %.1fC - System OK", local_temperature);
             }
         }
     }
@@ -114,29 +115,35 @@ void TaskTelemetry(void *pvParameters) {
 }
 
 //  Entry point
-//  Watchdog timer, mutex, event group and tasks initialization
+//  Creation of the context for protected system variables; initialization for watchdog, mutex, event group and tasks
 extern "C" void app_main() {
 
     ESP_LOGI(system_tag, "[INFO] Starting system...");
 
+    static SystemContext context;
+    context.temperature_mutex = xSemaphoreCreateMutex();
+    context.sensor_events = xEventGroupCreate();
+    context.current_temperature = 0.0f;
+    context.fault_sim = false;
+
     esp_task_wdt_config_t twdt_config = {
         .timeout_ms = 5000,
-        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,    // Bitmask of cores to be monitored (00000011)
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,    // Bitmask of cores to have their idle tasks monitored (00000011)
         .trigger_panic = true,                              // Triggers reset if lock up
     };
-    // _reconfigure instead of _init because it is already initialized in current ESP-IDF
+    // _reconfigure instead of _init because it is already initialized by default in current ESP-IDF
     esp_task_wdt_reconfigure(&twdt_config);
 
-    temperature_mutex = xSemaphoreCreateMutex();
-    sensor_events = xEventGroupCreate();
-    if (temperature_mutex == NULL || sensor_events == NULL) {
+    context.temperature_mutex = xSemaphoreCreateMutex();
+    context.sensor_events = xEventGroupCreate();
+    if (context.temperature_mutex == NULL || context.sensor_events == NULL) {
         ESP_LOGE(system_tag, "[FAULT] Mutex creation unsuccessful. System aborted.");
         return;
     }
 
     // Parameters: function, name, stack size (bytes), parameter to be passed, priority, optional task handle
-    xTaskCreate(TaskSensorReading, "TaskSensor", 2048, NULL, 5, NULL);
-    xTaskCreate(TaskLogic, "TaskLogic", 2048, NULL, 4, NULL);
-    xTaskCreate(TaskTelemetry,  "TaskTelemetry",   2048, NULL, 3, NULL);
+    xTaskCreate(TaskSensorReading, "TaskSensor", 2048, &context, 5, NULL);
+    xTaskCreate(TaskLogic, "TaskLogic", 2048, &context, 4, NULL);
+    xTaskCreate(TaskTelemetry,  "TaskTelemetry",   2048, &context, 3, NULL);
 
 }
