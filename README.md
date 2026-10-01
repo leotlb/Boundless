@@ -1,6 +1,6 @@
 # Boundless
 
-Learn by doing project with an ESP-32 and add-ons
+Learn by doing project with an ESP-32 with sensor reading from a DHT11 and further add-ons(WIP)
 
 ## Requirements (WIP)
 - ESP-IDF v6.0.1
