@@ -54,7 +54,11 @@ void TaskSensorReading(void *pvParameters) {
             ctx->fault_sim = sensor_DHT.InFailState();
             
             if ( sensor_DHT.ReadData() ) {
+                printf("Sucess! Temp: %.1f C, Umi: %.1f %%\n", sensor_DHT.GetTemperature(), sensor_DHT.GetHumidity());
                 ctx->current_temperature = sensor_DHT.GetTemperature();
+            }
+            else{
+                printf("Error: Comunication failure or invalid Checksum.\n");
             }
             
             xSemaphoreGive(ctx->temperature_mutex);
@@ -120,6 +124,7 @@ extern "C" void app_main() {
 
     ESP_LOGI(system_tag, "[INFO] Starting system...");
 
+    // Static to avoid cleanup after app_main is done and to restrict access to only the tasks created
     static SystemContext context;
     context.temperature_mutex = xSemaphoreCreateMutex();
     context.sensor_events = xEventGroupCreate();
